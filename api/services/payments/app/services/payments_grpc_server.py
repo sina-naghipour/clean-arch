@@ -1,6 +1,7 @@
 import grpc.aio
 import asyncio
 import logging
+from functools import wraps
 
 from protos import payments_pb2, payments_pb2_grpc
 from database import pydantic_models
@@ -9,15 +10,51 @@ from opentelemetry import trace
 
 from protos import commissions_pb2, commissions_pb2_grpc
 
+from database.connection import db_connection
+from cache.redis_cache import RedisCache
+from services.stripe_service import StripeService
+from services.commissions_service import CommissionService
+from repositories.commissions_repository import CommissionRepository
+from services.payments_service import PaymentService
+
+logger = logging.getLogger(__name__)
+
+async def get_payment_service_for_grpc(db_session, redis_cache):
+    commission_repository = CommissionRepository(db_session, logger)
+    commission_service = CommissionService(commission_repository, logger)
+    stripe_service = StripeService(logger)
+    
+    return PaymentService(
+        logger=logger,
+        db_session=db_session,
+        stripe_service=stripe_service,
+        redis_cache=redis_cache,
+        commission_service=commission_service
+    )
+
+def with_payment_service(func):
+    @wraps(func)
+    async def wrapper(self, request, context):
+        session = await db_connection.get_session()
+        try:
+            payment_service = await get_payment_service_for_grpc(session, self.redis_cache)
+            return await func(self, request, context, payment_service)
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
+    return wrapper
+
 class PaymentGRPCServer(payments_pb2_grpc.PaymentServiceServicer, commissions_pb2_grpc.CommissionServiceServicer):
-    def __init__(self, payment_service, commission_service, logger: logging.Logger):
-        self.payment_service = payment_service
-        self.commission_service = commission_service
+    def __init__(self, redis_cache, logger: logging.Logger):
+        self.redis_cache = redis_cache
         self.logger = logger
         self.tracer = trace.get_tracer(__name__)
 
     @trace_service_operation("grpc_create_payment")
-    async def CreatePayment(self, request, context):
+    @with_payment_service
+    async def CreatePayment(self, request, context, payment_service):
         try:
             with self.tracer.start_as_current_span("grpc.CreatePayment") as span:
                 span.set_attributes({
@@ -39,11 +76,10 @@ class PaymentGRPCServer(payments_pb2_grpc.PaymentServiceServicer, commissions_pb
                     span.set_attribute("idempotency.key", idempotency_key)
                     self.logger.info(f"CreatePayment with idempotency key: {idempotency_key}")
 
-                existing_payment = await self.payment_service.payment_repo.get_payment_by_order_id(request.order_id)
+                existing_payment = await payment_service.payment_repo.get_payment_by_order_id(request.order_id)
                 if existing_payment:
                     span.set_attribute("payment.exists", True)
-
-                    result = await self.payment_service.get_payment(str(existing_payment.id))
+                    result = await payment_service.get_payment(str(existing_payment.id))
                     client_secret = "NONE" if request.checkout_mode else result.client_secret
                     return payments_pb2.PaymentResponse(
                         payment_id=str(result.id),
@@ -62,7 +98,6 @@ class PaymentGRPCServer(payments_pb2_grpc.PaymentServiceServicer, commissions_pb
                 success_url = request.success_url if request.HasField("success_url") else None
                 cancel_url = request.cancel_url if request.HasField("cancel_url") else None
                 
-                
                 payment_data_dict = {
                     "order_id": request.order_id,
                     "amount": request.amount,
@@ -76,7 +111,8 @@ class PaymentGRPCServer(payments_pb2_grpc.PaymentServiceServicer, commissions_pb
                 }
                 payment_data_dict["referrer_id"] = request.referrer_id
                 payment_data = pydantic_models.PaymentCreate(**payment_data_dict)
-                result = await self.payment_service.create_payment(payment_data)
+                
+                result = await payment_service.create_payment(payment_data)
                 span.set_attribute("payment.id", str(result.id))
                 span.set_attribute("payment.status", str(result.status.value))
                 
@@ -104,7 +140,8 @@ class PaymentGRPCServer(payments_pb2_grpc.PaymentServiceServicer, commissions_pb
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
 
     @trace_service_operation("grpc_get_payment")
-    async def GetPayment(self, request, context):
+    @with_payment_service
+    async def GetPayment(self, request, context, payment_service):
         try:
             with self.tracer.start_as_current_span("grpc.GetPayment") as span:
                 span.set_attributes({
@@ -115,7 +152,7 @@ class PaymentGRPCServer(payments_pb2_grpc.PaymentServiceServicer, commissions_pb
                 
                 self.logger.info(f"gRPC GetPayment: {request.payment_id}")
                 
-                result = await self.payment_service.get_payment(request.payment_id)
+                result = await payment_service.get_payment(request.payment_id)
                 span.set_attribute("payment.status", str(result.status.value))
                 
                 checkout_url = getattr(result, 'checkout_url', None) or ""
@@ -143,7 +180,8 @@ class PaymentGRPCServer(payments_pb2_grpc.PaymentServiceServicer, commissions_pb
                 await context.abort(grpc.StatusCode.INTERNAL, str(e))
     
     @trace_service_operation("grpc_process_refund")
-    async def ProcessRefund(self, request, context):
+    @with_payment_service
+    async def ProcessRefund(self, request, context, payment_service):
         try:
             with self.tracer.start_as_current_span("grpc.ProcessRefund") as span:
                 span.set_attributes({
@@ -160,7 +198,7 @@ class PaymentGRPCServer(payments_pb2_grpc.PaymentServiceServicer, commissions_pb
                     reason=request.reason or None
                 )
                 
-                result = await self.payment_service.create_refund(request.payment_id, refund_data)
+                result = await payment_service.create_refund(request.payment_id, refund_data)
                 span.set_attribute("refund.id", str(result["id"]))
                 span.set_attribute("refund.status", str(result["status"]))
                 
@@ -180,7 +218,8 @@ class PaymentGRPCServer(payments_pb2_grpc.PaymentServiceServicer, commissions_pb
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
 
     @trace_service_operation("grpc_get_commission_report")
-    async def GetCommissionReport(self, request, context):
+    @with_payment_service
+    async def GetCommissionReport(self, request, context, payment_service):
         try:
             with self.tracer.start_as_current_span("grpc.GetCommissionReport") as span:
                 span.set_attributes({
@@ -191,7 +230,7 @@ class PaymentGRPCServer(payments_pb2_grpc.PaymentServiceServicer, commissions_pb
                 
                 self.logger.info(f"gRPC GetCommissionReport for referrer: {request.referrer_id}")
                 
-                report_dict = await self.commission_service.get_report(request.referrer_id)
+                report_dict = await payment_service.commission_service.get_report(request.referrer_id)
                 
                 return commissions_pb2.CommissionReport(
                     referrer_id=report_dict['referrer_id'],
@@ -217,18 +256,17 @@ class PaymentGRPCServer(payments_pb2_grpc.PaymentServiceServicer, commissions_pb
             self.logger.error(f"gRPC GetCommissionReport failed: {e}", exc_info=True)
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
 
-@trace_service_operation("serve_grpc")
-async def serve_grpc(payment_service, commission_service, host: str = "0.0.0.0", port: int = 50051):
+async def serve_grpc(redis_cache, host: str = "0.0.0.0", port: int = 50051):
     logger = logging.getLogger(__name__)
     
     server = grpc.aio.server()
     
     server.add_generic_rpc_handlers((
         payments_pb2_grpc.add_PaymentServiceServicer_to_server(
-            PaymentGRPCServer(payment_service, commission_service, logger), server
+            PaymentGRPCServer(redis_cache, logger), server
         ),
         commissions_pb2_grpc.add_CommissionServiceServicer_to_server(
-            PaymentGRPCServer(payment_service, commission_service, logger), server
+            PaymentGRPCServer(redis_cache, logger), server
         )
     ))
     

@@ -14,17 +14,10 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from services.stripe_service import StripeService
 
-from services.commissions_service import CommissionService
-from repositories.commissions_repository import CommissionRepository
-
-
+from database.connection import db_connection
 from routes.payments_routes import router as payment_router
-from services.payments_service import PaymentService
-from database.connection import get_db
 from services.payments_grpc_server import serve_grpc
-
 
 load_dotenv()
 
@@ -52,14 +45,12 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Async lifespan context manager for FastAPI"""
     logger.info("Starting Payments Service...")
     logger.info(f"Environment: {ENVIRONMENT}")
     logger.info(f"HTTP Host: {HOST}, HTTP Port: {PORT}")
     logger.info(f"gRPC Port: {GRPC_PORT}")
     logger.info(f"Stripe Mode: {os.getenv('STRIPE_MODE', 'test')}")
     
-    # Initialize OpenTelemetry tracing
     tracer_provider = TracerProvider()
     tracer_provider.add_span_processor(
         BatchSpanProcessor(
@@ -67,34 +58,28 @@ async def lifespan(app: FastAPI):
         )
     )
     trace.set_tracer_provider(tracer_provider)
+    
+    await db_connection.connect()
+    
     redis_cache = RedisCache()
     try:
         await redis_cache.connect()
         logger.info("Redis connected for idempotency")
     except Exception as e:
         logger.warning(f"Redis connection failed: {e}. Idempotency disabled.")
-        redis_cache = None 
-    async for session in get_db():
-        stripe_service = StripeService(logger)
-        commission_repository = CommissionRepository(session, logger)
-        commission_service = CommissionService(commission_repository, logger)
-        payment_service = PaymentService(logger, session,stripe_service=stripe_service, redis_cache=redis_cache, commission_service=commission_service)
-        
-        grpc_task = asyncio.create_task(
-            serve_grpc(payment_service, commission_service, port=GRPC_PORT)
-        )
-        
-        # Store for shutdown
-        app.state.payment_service = payment_service
-        app.state.grpc_task = grpc_task
-        app.state.redis_cache = redis_cache
-        break
+        redis_cache = None
+    
+    grpc_task = asyncio.create_task(
+        serve_grpc(redis_cache=redis_cache, port=GRPC_PORT)
+    )
+    
+    app.state.grpc_task = grpc_task
+    app.state.redis_cache = redis_cache
     
     yield
     
     logger.info("Shutting down Payments Service...")
     
-    # Cancel gRPC task
     if hasattr(app.state, 'grpc_task'):
         app.state.grpc_task.cancel()
         try:
@@ -115,7 +100,6 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Instrument the FastAPI app
 FastAPIInstrumentor.instrument_app(app)
 
 app.add_middleware(
@@ -172,7 +156,6 @@ async def health_check():
 
 @app.get("/ready", tags=["Health"])
 async def readiness_check():
-    # Optional: Add gRPC health check here
     return {
         "status": "ready",
         "service": "payments",
@@ -206,4 +189,3 @@ if __name__ == "__main__":
         reload=RELOAD,
         log_level=LOG_LEVEL
     )
-
